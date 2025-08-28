@@ -12,7 +12,6 @@ yarn-error.log*
 .env.production.local
 
 # Service account credentials
-service-account.json
 # Allow package.json files
 !package.json
 !package-lock.json

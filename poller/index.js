@@ -1,6 +1,8 @@
 require("dotenv").config();
 const { google } = require("googleapis");
 const { PubSub } = require("@google-cloud/pubsub");
+const credentials = require('./service-account.json'); // Path to your service account key
+
 
 const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
 const PUBSUB_TOPIC_NAME = process.env.PUBSUB_TOPIC_NAME;
@@ -69,8 +71,8 @@ async function pollAndPublish() {
   // Drive auth via ADC with domain-wide delegation
   const auth = new google.auth.GoogleAuth({
     scopes: ["https://www.googleapis.com/auth/drive"],
-    keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
-    subject: process.env.IMPERSONATE_USER_EMAIL, // User to impersonate
+    credentials
+    // subject: process.env.IMPERSONATE_USER_EMAIL, // User to impersonate
   });
   const drive = google.drive({ version: "v3", auth });
 
