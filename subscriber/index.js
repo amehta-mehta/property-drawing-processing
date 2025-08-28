@@ -78,11 +78,36 @@ async function loadProcessedFiles() {
   console.log(`Loaded ${rows.length} rows: ${processedFileSet.size} file IDs and ${processedFileNames.size} file names from sheet.`);
 }
 
-// Handle incoming messages
-function setupSubscription() {
-  subscription.on('message', async (message) => {
+// Queue for sequential message processing
+let messageQueue = [];
+let isProcessing = false;
+
+// Process messages sequentially
+async function processMessageQueue() {
+  if (isProcessing || messageQueue.length === 0) return;
+  
+  isProcessing = true;
+  console.log(`📋 Starting to process ${messageQueue.length} messages in queue`);
+  
+  while (messageQueue.length > 0) {
+    const message = messageQueue.shift();
     try {
-      console.log('\n=== NEW MESSAGE RECEIVED ===');
+      await processMessage(message);
+    } catch (error) {
+      console.error('Error in processMessage, continuing with next message:', error?.message ?? error);
+      // Still ack the message to prevent infinite retries
+      message.ack();
+    }
+  }
+  
+  console.log('✅ Finished processing all messages in queue');
+  isProcessing = false;
+}
+
+// Process a single message
+async function processMessage(message) {
+  try {
+    console.log('\n=== PROCESSING MESSAGE ===');
       const payload = JSON.parse(Buffer.from(message.data, 'base64').toString('utf8'));
       const fileId = payload.fileId;
       const fileName = payload.fileName?.toLowerCase();
@@ -141,6 +166,14 @@ function setupSubscription() {
       console.error('Error processing message:', error);
       message.nack();
     }
+}
+
+// Handle incoming messages by adding them to queue
+function setupSubscription() {
+  subscription.on('message', (message) => {
+    console.log('\n=== NEW MESSAGE RECEIVED - ADDING TO QUEUE ===');
+    messageQueue.push(message);
+    processMessageQueue(); // Start processing if not already running
   });
 
   subscription.on('error', (err) => console.error('Subscription error:', err));
