@@ -13,7 +13,9 @@ yarn-error.log*
 
 # Service account credentials
 service-account.json
-*.json
+# Allow package.json files
+!package.json
+!package-lock.json
 
 # Logs
 logs

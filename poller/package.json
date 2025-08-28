@@ -1,0 +1,21 @@
+{
+  "name": "property-drawing-poller",
+  "version": "1.0.0",
+  "description": "Poller service for property drawing processing",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "@google-cloud/pubsub": "^5.2.0",
+    "dotenv": "^17.2.1",
+    "express": "^4.18.2",
+    "googleapis": "^159.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "",
+  "license": "ISC"
+}
