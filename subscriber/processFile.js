@@ -23,7 +23,7 @@ function identifyPropertyFromFilename(filename) {
 }
 
 // Gemini RAG API to identify property if substring match fails
-async function getPropertyNameFromFilenameRAG(filename, propertyData, geminiApiKey) {
+async function getPropertyNameFromFilenameRAG(filename, propertyData, geminiApiKey, geminiSemaphore = null) {
   if (!propertyData || propertyData.length === 0) return null;
 
   let contextPrompt = "You are an assistant that identifies property names from filenames.\n";
@@ -39,11 +39,40 @@ async function getPropertyNameFromFilenameRAG(filename, propertyData, geminiApiK
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${geminiApiKey}`;
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
+  // Use semaphore to limit concurrent Gemini API calls
+  let releaseFunction = null;
+  if (geminiSemaphore) {
+    try {
+      releaseFunction = await geminiSemaphore.acquire();
+      console.log(`[Property ID] Acquired Gemini semaphore, current usage: ${await geminiSemaphore.getCurrentUsage()}`);
+    } catch (error) {
+      console.error('[Property ID] Failed to acquire Gemini semaphore:', error.message);
+      throw new Error(`Gemini rate limit acquisition failed: ${error.message}`);
+    }
+  }
+
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    
+    if (!res.ok) {
+      const errorText = await res.text();
+      console.error(`[Property ID] Gemini API error ${res.status}:`, errorText);
+      throw new Error(`Gemini API returned ${res.status}: ${errorText}`);
+    }
+  } catch (error) {
+    console.error('[Property ID] Gemini API request failed:', error.message);
+    throw error;
+  } finally {
+    if (releaseFunction) {
+      releaseFunction();
+      console.log(`[Property ID] Released Gemini semaphore`);
+    }
+  }
 
   const data = await res.json();
   const text = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
@@ -55,7 +84,7 @@ async function getPropertyNameFromFilenameRAG(filename, propertyData, geminiApiK
 }
 
 // Extract year from PDF using Gemini
-async function extractYearWithGemini(file, drive, geminiApiKey) {
+async function extractYearWithGemini(file, drive, geminiApiKey, geminiSemaphore = null) {
   if (!file.mimeType || !file.mimeType.includes('pdf')) return null;
 
   try {
@@ -103,21 +132,46 @@ Respond ONLY with a 4-digit year (1950-current) or UNKNOWN.
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${geminiApiKey}`;
 
+    // Use semaphore to limit concurrent Gemini API calls
+    let releaseFunction = null;
+    if (geminiSemaphore) {
+      try {
+        releaseFunction = await geminiSemaphore.acquire();
+        console.log(`[Year Extract] Acquired Gemini semaphore, current usage: ${await geminiSemaphore.getCurrentUsage()}`);
+      } catch (error) {
+        console.error('[Year Extract] Failed to acquire Gemini semaphore:', error.message);
+        return 'Unknown_Year';
+      }
+    }
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 second timeout
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      signal: controller.signal
-    });
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
 
-    clearTimeout(timeoutId);
+      clearTimeout(timeoutId);
 
-    if (!res.ok) {
-      console.error(`Gemini API error: ${res.status} ${res.statusText}`);
-      return 'Unknown_Year';
+      if (!res.ok) {
+        const errorText = await res.text();
+        console.error(`[Year Extract] Gemini API error ${res.status}:`, errorText);
+        return 'Unknown_Year';
+      }
+    } catch (error) {
+      clearTimeout(timeoutId);
+      console.error('[Year Extract] Gemini API request failed:', error.message);
+      throw error;
+    } finally {
+      if (releaseFunction) {
+        releaseFunction();
+        console.log(`[Year Extract] Released Gemini semaphore`);
+      }
     }
 
     const data = await res.json();
@@ -201,12 +255,12 @@ async function moveFileToOrganizedFolder(drive, fileId, propertyName, year, main
 }
 
 // Main processing function
-async function processFile(file, propertyData, drive, mainFolderId, geminiApiKey) {
+async function processFile(file, propertyData, drive, mainFolderId, geminiApiKey, geminiSemaphore = null) {
   try {
     let propertyMatch = identifyPropertyFromFilename(file.name);
 
     if (!propertyMatch) {
-      propertyMatch = await getPropertyNameFromFilenameRAG(file.name, propertyData, geminiApiKey);
+      propertyMatch = await getPropertyNameFromFilenameRAG(file.name, propertyData, geminiApiKey, geminiSemaphore);
       console.log(`🏢 Property identified by RAG: ${propertyMatch}`);
     } else {
       console.log(`🏢 Property identified normally: ${propertyMatch}`);
@@ -216,7 +270,7 @@ async function processFile(file, propertyData, drive, mainFolderId, geminiApiKey
       propertyMatch = 'Unidentified';
     }
 
-    const year = await extractYearWithGemini(file, drive, geminiApiKey) || 'Unknown_Year';
+    const year = await extractYearWithGemini(file, drive, geminiApiKey, geminiSemaphore) || 'Unknown_Year';
     console.log(`📅 Year extracted: ${year}`);
 
     await moveFileToOrganizedFolder(drive, file.id, propertyMatch, year, mainFolderId);

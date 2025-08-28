@@ -8,6 +8,16 @@ const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { processFile } = require('./processFile.js');
 const { getOrCreateDestinationFolder, propertyMap, getPropertyData } = require('./sheetUtils.js');
 const credentials = require('./service-account.json');
+const { LocalSemaphore } = require('./distributedSemaphore');
+
+const MAX_GEMINI_CONCURRENT = parseInt(process.env.MAX_GEMINI_CONCURRENT) || 5;
+const MAX_CONCURRENT_PROCESSING = parseInt(process.env.MAX_CONCURRENT_PROCESSING) || 5;
+
+// Initialize local Gemini semaphore for rate limiting
+const geminiSemaphore = new LocalSemaphore('gemini-api', MAX_GEMINI_CONCURRENT);
+
+// Initialize local processing semaphore (separate from Gemini semaphore)
+const processingSemaphore = new LocalSemaphore('processing', MAX_CONCURRENT_PROCESSING);
 
 const app = express();
 const PORT = process.env.PORT || 8081;
@@ -83,91 +93,172 @@ async function loadProcessedFiles() {
 let messageQueue = [];
 let isProcessing = false;
 
-// Process messages sequentially
+// Process messages with parallel processing and concurrency control
 async function processMessageQueue() {
   if (isProcessing || messageQueue.length === 0) return;
   
   isProcessing = true;
-  console.log(`📋 Starting to process ${messageQueue.length} messages in queue`);
+  const messagesToProcess = messageQueue.splice(0); // Take all messages
   
-  while (messageQueue.length > 0) {
-    const message = messageQueue.shift();
+  console.log(`🚀 Processing ${messagesToProcess.length} messages in parallel (max concurrent: ${MAX_CONCURRENT_PROCESSING})`);
+  console.log(`📊 Current Gemini semaphore usage: ${await geminiSemaphore.getCurrentUsage()}`);
+  
+  // Process messages concurrently with semaphore control
+  const processingPromises = messagesToProcess.map(async (message, index) => {
+    const releaseProcessing = await processingSemaphore.acquire();
     try {
+      console.log(`📝 [${index + 1}/${messagesToProcess.length}] Starting message processing`);
       await processMessage(message);
+      console.log(`✅ [${index + 1}/${messagesToProcess.length}] Message processed successfully`);
     } catch (error) {
-      console.error('Error in processMessage, continuing with next message:', error?.message ?? error);
-      // Still ack the message to prevent infinite retries
-      message.ack();
+      console.error(`❌ [${index + 1}/${messagesToProcess.length}] Error processing message:`, {
+        error: error.message,
+        stack: error.stack,
+        messageData: message.data ? message.data.toString() : 'no data'
+      });
+      // Don't throw - we want to continue processing other messages
+    } finally {
+      releaseProcessing();
     }
-  }
+  });
   
-  console.log('✅ Finished processing all messages in queue');
+  await Promise.all(processingPromises);
+  
+  console.log(`🏁 Completed processing batch of ${messagesToProcess.length} messages`);
   isProcessing = false;
+  
+  // Process any new messages that arrived while we were processing
+  if (messageQueue.length > 0) {
+    setImmediate(() => processMessageQueue());
+  }
 }
 
 // Process a single message
 async function processMessage(message) {
+  let payload = null;
+  let fileId = null;
+  let fileName = null;
+  
   try {
     console.log('\n=== PROCESSING MESSAGE ===');
-      const payload = JSON.parse(Buffer.from(message.data, 'base64').toString('utf8'));
-      const fileId = payload.fileId;
-      const fileName = payload.fileName?.toLowerCase();
+    
+    try {
+      payload = JSON.parse(Buffer.from(message.data, 'base64').toString('utf8'));
+      fileId = payload.fileId;
+      fileName = payload.fileName?.toLowerCase();
+      
+      console.log(`🔄 Processing file ID: ${fileId}, fileName: ${fileName}`);
+    } catch (parseError) {
+      console.error('❌ Error parsing message payload:', {
+        error: parseError.message,
+        rawData: message.data ? message.data.toString() : 'no data'
+      });
+      message.ack(); // Ack malformed messages
+      return;
+    }
 
-      console.log(`🔄 Processing file ID: ${fileId}`);
+    if (!fileId || !fileName) {
+      console.log('⏭️  Missing fileId or fileName, skipping message');
+      message.ack();
+      return;
+    }
 
-      if (!fileId || !fileName) {
-        message.ack();
-        return;
-      }
+    // Skip if already processed
+    if (processedFileSet.has(fileId) || processedFileNames.has(fileName)) {
+      console.log(`⏭️  Skipping already processed file: ${fileName}`);
+      message.ack();
+      return;
+    }
 
-      // Skip if already processed
-      if (processedFileSet.has(fileId) || processedFileNames.has(fileName)) {
-        console.log(`⏭️  Skipping already processed file: ${fileName}`);
-        message.ack();
-        return;
-      }
-
-      // Fetch metadata from Drive
+    // Fetch metadata from Drive
+    let file;
+    try {
       const res = await drive.files.get({
         fileId,
         fields: 'id, name, mimeType, parents',
         supportsAllDrives: true,
         includeItemsFromAllDrives: true
       });
-      const file = res.data;
-
-      try {
-         await processFile(file, propertyData, drive, mainDestinationFolderId, GEMINI_API_KEY);
-
-         // Add to processed set to avoid duplicates
-         processedFileSet.add(file.id);
-         processedFileNames.add(file.name.toLowerCase());
-
-         // Add to ProcessedFiles sheet after successful processing and copying
-         await addProcessedFileToSheet(file.id, file.name);
-         console.log(`📊 File added to ProcessedFiles sheet\n`);
-
-         message.ack();
-      } catch (processError) {
-        console.error('Error during file processing:', processError?.message ?? processError);
-
-        // For certain errors, mark as processed to avoid infinite retries
-        const msg = String(processError?.message ?? '');
-        if (msg.includes('PDF too large') || msg.includes('timeout') || msg.includes('400 Bad Request')) {
-          console.log('Marking file as processed due to permanent error');
-          processedFileSet.add(file.id);
-          processedFileNames.add(file.name.toLowerCase());
-          await addProcessedFileToSheet(file.id, file.name + ' (ERROR: ' + msg + ')');
-          message.ack();
-        } else {
-          // For other errors, nack to retry
-          message.nack();
-        }
+      file = res.data;
+      console.log(`🔍 Found file in Drive: ${file.name} (ID: ${file.id})`);
+    } catch (driveError) {
+      console.error('❌ Error fetching file from Drive:', {
+        error: driveError.message,
+        fileId: fileId,
+        fileName: fileName,
+        stack: driveError.stack
+      });
+      
+      // Check if it's a not found error (permanent) vs temporary error
+      if (driveError.message.includes('not found') || driveError.message.includes('404')) {
+        console.log('💀 File not found in Drive, acknowledging message');
+        message.ack();
+      } else {
+        console.log('🔄 Temporary Drive error, will retry');
+        message.nack();
       }
-    } catch (error) {
-      console.error('Error processing message:', error);
-      message.nack();
+      return;
     }
+
+    try {
+      console.log(`🚀 Starting file processing for: ${file.name}`);
+      await processFile(file, propertyData, drive, mainDestinationFolderId, GEMINI_API_KEY, geminiSemaphore);
+
+      // Add to processed set to avoid duplicates
+      processedFileSet.add(file.id);
+      processedFileNames.add(file.name.toLowerCase());
+
+      // Add to ProcessedFiles sheet after successful processing and copying
+      try {
+        await addProcessedFileToSheet(file.id, file.name);
+        console.log(`📊 File added to ProcessedFiles sheet: ${file.name}`);
+      } catch (sheetError) {
+        console.error('⚠️  Warning: Failed to add to sheet (file still processed):', {
+          error: sheetError.message,
+          fileName: file.name
+        });
+      }
+
+      console.log(`✅ File processed successfully: ${file.name}\n`);
+      message.ack();
+    } catch (processError) {
+      console.error('❌ Error during file processing:', {
+        error: processError.message,
+        stack: processError.stack,
+        fileName: file.name,
+        fileId: file.id,
+        errorType: processError.constructor.name
+      });
+
+      // For certain errors, mark as processed to avoid infinite retries
+      const msg = String(processError?.message ?? '');
+      if (msg.includes('PDF too large') || msg.includes('timeout') || msg.includes('400 Bad Request') || msg.includes('rate limit') || msg.includes('429')) {
+        console.log('💀 Marking file as processed due to permanent/rate-limit error');
+        processedFileSet.add(file.id);
+        processedFileNames.add(file.name.toLowerCase());
+        
+        try {
+          await addProcessedFileToSheet(file.id, file.name + ' (ERROR: ' + msg + ')');
+        } catch (sheetError) {
+          console.error('⚠️  Failed to add error record to sheet:', sheetError.message);
+        }
+        
+        message.ack();
+      } else {
+        console.log('🔄 Retryable error, will nack message');
+        message.nack();
+      }
+    }
+  } catch (error) {
+    console.error('❌ Unexpected error processing message:', {
+      error: error.message,
+      stack: error.stack,
+      fileId: fileId,
+      fileName: fileName,
+      payload: payload
+    });
+    message.nack();
+  }
 }
 
 // Handle incoming messages by adding them to queue
@@ -184,7 +275,6 @@ function setupSubscription() {
 async function initializeApp() {
   console.log('Starting application initialization...');
 
-  // 1) Create Google auth client using service account credentials
   const auth = new google.auth.GoogleAuth({
     scopes: [
       'https://www.googleapis.com/auth/drive',
@@ -194,28 +284,23 @@ async function initializeApp() {
     credentials
   });
 
-  // Obtain a client which can be used with googleapis and google-spreadsheet
   authClient = await auth.getClient();
   drive = google.drive({ version: 'v3', auth: authClient });
 
-  // 2) Load existing processed files from sheet
   await loadProcessedFiles();
 
-  // 3) Load property data from properties sheet (using sheetUtils.getPropertyData)
   propertyData = await getPropertyData(SPREADSHEET_ID, PROPERTY_SHEET_NAME, credentials)
     .catch(err => {
       console.error('Failed to load property data:', err);
       return [];
     });
 
-  // 3) Get or create main destination folder
   console.log('Creating/getting main destination folder...');
   mainDestinationFolderId = await getOrCreateDestinationFolder(drive);
   console.log(`Main destination folder ID: ${mainDestinationFolderId}`);
 
   console.log('Setup complete. Starting subscriber...');
 
-  // Start subscription only after initialization is complete
   setupSubscription();
   console.log('Subscriber is now listening for messages.');
 }
@@ -226,12 +311,32 @@ app.get('/health', (req, res) => {
 });
 
 // Status endpoint
-app.get('/status', (req, res) => {
-  res.json({
-    status: 'running',
-    processedFiles: processedFileSet.size,
-    mainDestinationFolderId
-  });
+app.get('/status', async (req, res) => {
+  try {
+    res.json({
+      status: 'healthy',
+      processedFiles: processedFileSet.size,
+      processedFileNames: processedFileNames.size,
+      queueLength: messageQueue.length,
+      isProcessing: isProcessing,
+      concurrency: {
+        maxConcurrentProcessing: MAX_CONCURRENT_PROCESSING,
+        maxGeminiConcurrent: MAX_GEMINI_CONCURRENT
+      },
+      geminiSemaphore: {
+        limit: MAX_GEMINI_CONCURRENT,
+        available: await geminiSemaphore.getAvailablePermits(),
+        currentUsage: await geminiSemaphore.getCurrentUsage(),
+        type: 'local'
+      },
+      processingType: 'local-parallel'
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      error: error.message
+    });
+  }
 });
 
 // Start the server
