@@ -7,6 +7,7 @@ const { google } = require('googleapis');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { processFile } = require('./processFile.js');
 const { getOrCreateDestinationFolder, propertyMap, getPropertyData } = require('./sheetUtils.js');
+const credentials = require('./service-account.json');
 
 const app = express();
 const PORT = process.env.PORT || 8081;
@@ -28,7 +29,7 @@ let drive; // will create after obtaining auth client
 let authClient; // OAuth2 client for google-spreadsheet
 
 // Initialize Pub/Sub client and subscription
-const pubsub = new PubSub({ projectId: PROJECT_ID });
+const pubsub = new PubSub({ projectId: PROJECT_ID, keyFilename: './service-account.json' });
 const subscription = pubsub.subscription(SUBSCRIPTION_NAME);
 
 // Cache of processed files
@@ -130,7 +131,8 @@ async function processMessage(message) {
       const res = await drive.files.get({
         fileId,
         fields: 'id, name, mimeType, parents',
-        supportsAllDrives: true
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true
       });
       const file = res.data;
 
@@ -171,7 +173,7 @@ async function processMessage(message) {
 // Handle incoming messages by adding them to queue
 function setupSubscription() {
   subscription.on('message', (message) => {
-    console.log('\n=== NEW MESSAGE RECEIVED - ADDING TO QUEUE ===');
+    // console.log('\n=== NEW MESSAGE RECEIVED - ADDING TO QUEUE ===');
     messageQueue.push(message);
     processMessageQueue(); // Start processing if not already running
   });
@@ -182,13 +184,14 @@ function setupSubscription() {
 async function initializeApp() {
   console.log('Starting application initialization...');
 
-  // 1) Create Google auth client using ADC (Cloud Run service account) or credentials from environment
+  // 1) Create Google auth client using service account credentials
   const auth = new google.auth.GoogleAuth({
     scopes: [
       'https://www.googleapis.com/auth/drive',
       'https://www.googleapis.com/auth/spreadsheets',
       'https://www.googleapis.com/auth/drive.file'
-    ]
+    ],
+    credentials
   });
 
   // Obtain a client which can be used with googleapis and google-spreadsheet
@@ -198,18 +201,14 @@ async function initializeApp() {
   // 2) Load existing processed files from sheet
   await loadProcessedFiles();
 
-  // 3) Load service account credentials for google-spreadsheet
-  const serviceAccountPath = process.env.GOOGLE_APPLICATION_CREDENTIALS || './service-account.json';
-  const serviceAccountCreds = JSON.parse(fs.readFileSync(serviceAccountPath, 'utf8'));
-
-  // 4) Load property data from properties sheet (using sheetUtils.getPropertyData)
-  propertyData = await getPropertyData(SPREADSHEET_ID, PROPERTY_SHEET_NAME, serviceAccountCreds)
+  // 3) Load property data from properties sheet (using sheetUtils.getPropertyData)
+  propertyData = await getPropertyData(SPREADSHEET_ID, PROPERTY_SHEET_NAME, credentials)
     .catch(err => {
       console.error('Failed to load property data:', err);
       return [];
     });
 
-  // 4) Get or create main destination folder
+  // 3) Get or create main destination folder
   console.log('Creating/getting main destination folder...');
   mainDestinationFolderId = await getOrCreateDestinationFolder(drive);
   console.log(`Main destination folder ID: ${mainDestinationFolderId}`);

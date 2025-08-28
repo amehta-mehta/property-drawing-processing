@@ -12,7 +12,7 @@ RUN npm install --omit=dev
 
 # Copy the rest of the application code
 COPY . .
-
+COPY service-account.json ./service-account.json
 # Create a non-root user to run the application
 RUN addgroup -g 1001 -S nodejs
 RUN adduser -S nodejs -u 1001
