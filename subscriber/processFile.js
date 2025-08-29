@@ -2,6 +2,7 @@
 const fetch = require('node-fetch');
 const pdf = require('pdf-parse');
 const { google } = require('googleapis');
+
 const { propertyMap } = require('./sheetUtils.js');
 
 // Normalize filename for matching
@@ -110,13 +111,11 @@ async function extractYearWithGemini(file, drive, geminiApiKey, geminiSemaphore 
     }
 
     const base64Data = buffer.toString('base64');
-
-    const maxBase64Size = 35 * 1024 * 1024; // 10MB in characters
+    const maxBase64Size = 48 * 1024 * 1024; // 35MB in characters
     if (base64Data.length > maxBase64Size) {
       console.log(`⚠️  PDF too large for Gemini API, skipping year extraction`);
       return 'Unknown_Year';
     }
-
     const prompt = `
 Look at this construction/landscape drawing PDF and find the YEAR it was created.
 Respond ONLY with a 4-digit year (1950-current) or UNKNOWN.

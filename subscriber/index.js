@@ -11,7 +11,6 @@ const { LocalSemaphore } = require('./distributedSemaphore');
 
 const MAX_GEMINI_CONCURRENT = parseInt(process.env.MAX_GEMINI_CONCURRENT) || 5;
 const MAX_CONCURRENT_PROCESSING = parseInt(process.env.MAX_CONCURRENT_PROCESSING) || 5;
-
 // Initialize local Gemini semaphore for rate limiting
 const geminiSemaphore = new LocalSemaphore('gemini-api', MAX_GEMINI_CONCURRENT);
 
@@ -44,9 +43,75 @@ let authClient; // OAuth2 client for google-spreadsheet
 const processedFileSet = new Set();
 const processedFileNames = new Set();
 
-// Function to add processed file to sheet
-async function addProcessedFileToSheet(fileId, fileName) {
+// Batch queue for sheet operations to reduce API calls
+const sheetWriteQueue = [];
+const SHEET_BATCH_SIZE = 5; // Write to sheet in batches of 5 (reduced from 10)
+const SHEET_BATCH_DELAY = 15000; // 15 second delay between batch writes (increased from 5s)
+
+// Function to add processed file to batch queue
+function queueFileForSheet(fileId, fileName) {
+  sheetWriteQueue.push({
+    'File ID': fileId,
+    'File Name': fileName,
+    'Processed Date': new Date().toISOString()
+  });
+  console.log(`Queued file for sheet: ${fileName} (${fileId}) - Queue size: ${sheetWriteQueue.length}`);
+}
+
+// Function to flush batch queue to sheet with retry logic
+async function flushSheetQueue() {
+  if (sheetWriteQueue.length === 0) return;
+  
+  const rowsToAdd = sheetWriteQueue.splice(0, SHEET_BATCH_SIZE);
+  let retryCount = 0;
+  const maxRetries = 3;
+  
+  while (retryCount <= maxRetries) {
+    try {
+      console.log(`📊 Writing ${rowsToAdd.length} rows to ProcessedFiles sheet... (attempt ${retryCount + 1})`);
+      
+      const doc = new GoogleSpreadsheet(SPREADSHEET_ID);
+      if (!authClient) throw new Error('Auth client not initialized for Google Sheets');
+      await doc.useOAuth2Client(authClient);
+      await doc.loadInfo();
+
+      const sheet = doc.sheetsByTitle[SHEET_NAME];
+      if (!sheet) throw new Error(`Sheet "${SHEET_NAME}" not found`);
+
+      // Add all rows in a single batch operation
+      await sheet.addRows(rowsToAdd);
+      console.log(`✅ Successfully wrote ${rowsToAdd.length} rows to sheet`);
+      return; // Success, exit retry loop
+      
+    } catch (error) {
+      retryCount++;
+      const isQuotaError = error?.message?.includes('Quota exceeded') || error?.message?.includes('quota');
+      const isRateLimit = error?.message?.includes('rate') || error?.message?.includes('limit');
+      
+      if ((isQuotaError || isRateLimit) && retryCount <= maxRetries) {
+        const backoffDelay = Math.min(30000 * Math.pow(2, retryCount - 1), 300000); // Exponential backoff, max 5 minutes
+        console.warn(`⚠️  Quota/rate limit error (attempt ${retryCount}/${maxRetries + 1}). Waiting ${backoffDelay/1000}s before retry...`);
+        await new Promise(resolve => setTimeout(resolve, backoffDelay));
+      } else {
+        console.error(`❌ Error writing batch to ProcessedFiles sheet (attempt ${retryCount}/${maxRetries + 1}):`, error?.message ?? error);
+        if (retryCount > maxRetries) {
+          console.error('❌ Max retries exceeded. Re-queuing failed rows.');
+          // Re-queue failed rows at the beginning
+          sheetWriteQueue.unshift(...rowsToAdd);
+          return;
+        }
+      }
+    }
+  }
+}
+
+// Start periodic sheet flushing
+setInterval(flushSheetQueue, SHEET_BATCH_DELAY);
+
+// Load existing files from Google Sheet
+async function loadProcessedFiles() {
   try {
+    console.log('📊 Loading processed files from sheet...');
     const doc = new GoogleSpreadsheet(SPREADSHEET_ID);
     if (!authClient) throw new Error('Auth client not initialized for Google Sheets');
     await doc.useOAuth2Client(authClient);
@@ -55,36 +120,19 @@ async function addProcessedFileToSheet(fileId, fileName) {
     const sheet = doc.sheetsByTitle[SHEET_NAME];
     if (!sheet) throw new Error(`Sheet "${SHEET_NAME}" not found`);
 
-    await sheet.addRow({
-      'File ID': fileId,
-      'File Name': fileName,
-      'Processed Date': new Date().toISOString()
-    });
-    console.log(`Added processed file to sheet: ${fileName} (${fileId})`);
+    const rows = await sheet.getRows();
+    for (const row of rows) {
+      // google-spreadsheet rows may expose values as properties or via row.get
+      const fileId = typeof row.get === 'function' ? row.get('File ID') : row['File ID'] ?? row.fileId;
+      const fileName = typeof row.get === 'function' ? row.get('File Name') : row['File Name'] ?? row.fileName;
+      if (fileId) processedFileSet.add(fileId);
+      if (fileName) processedFileNames.add(String(fileName).toLowerCase());
+    }
+    console.log(`✅ Loaded ${rows.length} rows: ${processedFileSet.size} file IDs and ${processedFileNames.size} file names from sheet.`);
   } catch (error) {
-    console.error('Error adding file to ProcessedFiles sheet:', error?.message ?? error);
+    console.error('❌ Error loading processed files from sheet:', error?.message ?? error);
+    throw error;
   }
-}
-
-// Load existing files from Google Sheet
-async function loadProcessedFiles() {
-  const doc = new GoogleSpreadsheet(SPREADSHEET_ID);
-  if (!authClient) throw new Error('Auth client not initialized for Google Sheets');
-  await doc.useOAuth2Client(authClient);
-  await doc.loadInfo();
-
-  const sheet = doc.sheetsByTitle[SHEET_NAME];
-  if (!sheet) throw new Error(`Sheet "${SHEET_NAME}" not found`);
-
-  const rows = await sheet.getRows();
-  for (const row of rows) {
-    // google-spreadsheet rows may expose values as properties or via row.get
-    const fileId = typeof row.get === 'function' ? row.get('File ID') : row['File ID'] ?? row.fileId;
-    const fileName = typeof row.get === 'function' ? row.get('File Name') : row['File Name'] ?? row.fileName;
-    if (fileId) processedFileSet.add(fileId);
-    if (fileName) processedFileNames.add(String(fileName).toLowerCase());
-  }
-  console.log(`Loaded ${rows.length} rows: ${processedFileSet.size} file IDs and ${processedFileNames.size} file names from sheet.`);
 }
 
 // Batch processing configuration
@@ -209,16 +257,8 @@ async function processFileFromDrive(file) {
       processedFileSet.add(fileId);
       processedFileNames.add(fileName.toLowerCase());
       
-      // Add to ProcessedFiles sheet after successful processing
-      try {
-        await addProcessedFileToSheet(fileId, fileName);
-        console.log(`📊 File added to ProcessedFiles sheet: ${fileName}`);
-      } catch (sheetError) {
-        console.error('⚠️  Warning: Failed to add to sheet (file still processed):', {
-          error: sheetError.message,
-          fileName: fileName
-        });
-      }
+      // Queue file for batch processing to ProcessedFiles sheet
+      queueFileForSheet(fileId, fileName);
       
       console.log(`✅ File processed successfully: ${fileName}`);
       totalFilesProcessed++;
@@ -238,11 +278,8 @@ async function processFileFromDrive(file) {
         processedFileNames.add(fileName.toLowerCase());
         totalFilesProcessed++;
         
-        try {
-          await addProcessedFileToSheet(fileId, fileName + ' (ERROR: ' + msg + ')');
-        } catch (sheetError) {
-          console.error('⚠️  Failed to add error record to sheet:', sheetError.message);
-        }
+        // Queue error record for batch processing
+        queueFileForSheet(fileId, fileName + ' (ERROR: ' + msg + ')');
       } else {
         console.log('⚠️  Continuing with next file...');
       }
@@ -286,6 +323,12 @@ async function gracefulShutdown() {
     console.log(`   Still processing batch ${currentBatchIndex + 1}...`);
   }
   
+  // Flush any remaining queued sheet writes
+  if (sheetWriteQueue.length > 0) {
+    console.log(`📊 Flushing ${sheetWriteQueue.length} remaining sheet entries...`);
+    await flushSheetQueue();
+  }
+  
   console.log('✅ All processing completed.');
   console.log('👋 Shutdown complete.');
   process.exit(0);
@@ -308,11 +351,12 @@ async function initializeApp() {
 
   await loadProcessedFiles();
 
-  propertyData = await getPropertyData(SPREADSHEET_ID, PROPERTY_SHEET_NAME, credentials)
-    .catch(err => {
-      console.error('Failed to load property data:', err);
-      return [];
-    });
+  try {
+    propertyData = await getPropertyData(SPREADSHEET_ID, PROPERTY_SHEET_NAME, credentials);
+  } catch (err) {
+    console.error('Failed to load property data:', err);
+    propertyData = [];
+  }
 
   console.log('Creating/getting main destination folder...');
   mainDestinationFolderId = await getOrCreateDestinationFolder(drive);

@@ -68,32 +68,38 @@ async function getPropertyData(spreadsheetId, sheetName, creds) {
     throw new Error('Service account credentials (client_email and private_key) are required');
   }
 
-  const doc = new GoogleSpreadsheet(spreadsheetId);
+  try {
+    console.log('📊 Loading property data from sheet...');
+    const doc = new GoogleSpreadsheet(spreadsheetId);
 
-  // Authenticate with service account credentials
-  await doc.useServiceAccountAuth({
-    client_email: creds.client_email,
-    private_key: creds.private_key,
-  });
+    // Authenticate with service account credentials
+    await doc.useServiceAccountAuth({
+      client_email: creds.client_email,
+      private_key: creds.private_key,
+    });
 
-  await doc.loadInfo();
+    await doc.loadInfo();
 
-  const sheet = doc.sheetsByTitle[sheetName];
-  if (!sheet) throw new Error(`Sheet "${sheetName}" not found`);
+    const sheet = doc.sheetsByTitle[sheetName];
+    if (!sheet) throw new Error(`Sheet "${sheetName}" not found`);
 
-  const rows = await sheet.getRows();
-  console.log(`Loaded ${rows.length} properties from sheet`);
+    const rows = await sheet.getRows();
+    console.log(`✅ Loaded ${rows.length} properties from sheet`);
 
-  // Return array of { name, address } and filter out incomplete rows
-  const properties = rows
-    .map(row => {
-      const name = readRowField(row, 'Name');
-      const address = readRowField(row, 'Address');
-      return { name, address };
-    })
-    .filter(p => p.name && p.address);
+    // Return array of { name, address } and filter out incomplete rows
+    const properties = rows
+      .map(row => {
+        const name = readRowField(row, 'Name');
+        const address = readRowField(row, 'Address');
+        return { name, address };
+      })
+      .filter(p => p.name && p.address);
 
-  return properties;
+    return properties;
+  } catch (error) {
+    console.error('❌ Error loading property data from sheet:', error?.message ?? error);
+    throw error;
+  }
 }
 
 module.exports = {
