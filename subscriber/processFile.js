@@ -128,7 +128,7 @@ Respond ONLY with a 4-digit year (1950-current) or UNKNOWN.
       generationConfig: { temperature: 0.0, topK: 1, topP: 0.1, candidateCount: 1 }
     };
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${geminiApiKey}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`;
 
     // Use semaphore to limit concurrent Gemini API calls
     let releaseFunction = null;
