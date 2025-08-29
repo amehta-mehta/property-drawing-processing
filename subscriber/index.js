@@ -2,7 +2,6 @@
 require('dotenv/config');
 const express = require('express');
 const fs = require('fs');
-const { PubSub } = require('@google-cloud/pubsub');
 const { google } = require('googleapis');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { processFile } = require('./processFile.js');
@@ -23,14 +22,15 @@ const app = express();
 const PORT = process.env.PORT || 8081;
 
 const PROJECT_ID = process.env.PROJECT_ID;
-const SUBSCRIPTION_NAME = process.env.PUBSUB_SUBSCRIPTION;
+// Removed Pub/Sub subscription - now processing directly from Drive
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const SHEET_NAME = process.env.SHEET_NAME; // ProcessedFiles
 const PROPERTY_SHEET_NAME = process.env.PROPERTY_SHEET_NAME; // Properties
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
 
-if (!PROJECT_ID || !SUBSCRIPTION_NAME || !SPREADSHEET_ID || !SHEET_NAME || !PROPERTY_SHEET_NAME) {
-  throw new Error("Missing required environment variables. Ensure PROJECT_ID, PUBSUB_SUBSCRIPTION, SPREADSHEET_ID, SHEET_NAME, and PROPERTY_SHEET_NAME are set.");
+if (!PROJECT_ID || !GOOGLE_DRIVE_FOLDER_ID || !SPREADSHEET_ID || !SHEET_NAME || !PROPERTY_SHEET_NAME || !GEMINI_API_KEY) {
+  throw new Error('Missing required environment variables. Please check your .env file.');
 }
 
 let propertyData = [];
@@ -38,9 +38,7 @@ let mainDestinationFolderId = null;
 let drive; // will create after obtaining auth client
 let authClient; // OAuth2 client for google-spreadsheet
 
-// Initialize Pub/Sub client and subscription
-const pubsub = new PubSub({ projectId: PROJECT_ID, keyFilename: './service-account.json' });
-const subscription = pubsub.subscription(SUBSCRIPTION_NAME);
+
 
 // Cache of processed files
 const processedFileSet = new Set();
@@ -89,187 +87,208 @@ async function loadProcessedFiles() {
   console.log(`Loaded ${rows.length} rows: ${processedFileSet.size} file IDs and ${processedFileNames.size} file names from sheet.`);
 }
 
-// Queue for sequential message processing
-let messageQueue = [];
+// Batch processing configuration
+const BATCH_SIZE = 100; // Process files in batches of 100
+const PROCESSING_DELAY = 2000; // 2 second delay between batches
 let isProcessing = false;
+let currentBatchIndex = 0;
+let allFiles = [];
 
-// Process messages with parallel processing and concurrency control
-async function processMessageQueue() {
-  if (isProcessing || messageQueue.length === 0) return;
+// Statistics tracking
+let totalFilesProcessed = 0;
+let totalFilesSkipped = 0;
+let startTime = Date.now();
+
+// Fetch all files from Google Drive folder
+async function fetchAllFiles() {
+  console.log('📁 Fetching all files from Google Drive folder...');
+  const files = [];
+  let pageToken = null;
   
-  isProcessing = true;
-  const messagesToProcess = messageQueue.splice(0); // Take all messages
-  
-  console.log(`🚀 Processing ${messagesToProcess.length} messages in parallel (max concurrent: ${MAX_CONCURRENT_PROCESSING})`);
-  console.log(`📊 Current Gemini semaphore usage: ${await geminiSemaphore.getCurrentUsage()}`);
-  
-  // Process messages concurrently with semaphore control
-  const processingPromises = messagesToProcess.map(async (message, index) => {
-    const releaseProcessing = await processingSemaphore.acquire();
+  do {
     try {
-      console.log(`📝 [${index + 1}/${messagesToProcess.length}] Starting message processing`);
-      await processMessage(message);
-      console.log(`✅ [${index + 1}/${messagesToProcess.length}] Message processed successfully`);
-    } catch (error) {
-      console.error(`❌ [${index + 1}/${messagesToProcess.length}] Error processing message:`, {
-        error: error.message,
-        stack: error.stack,
-        messageData: message.data ? message.data.toString() : 'no data'
-      });
-      // Don't throw - we want to continue processing other messages
-    } finally {
-      releaseProcessing();
-    }
-  });
-  
-  await Promise.all(processingPromises);
-  
-  console.log(`🏁 Completed processing batch of ${messagesToProcess.length} messages`);
-  isProcessing = false;
-  
-  // Process any new messages that arrived while we were processing
-  if (messageQueue.length > 0) {
-    setImmediate(() => processMessageQueue());
-  }
-}
-
-// Process a single message
-async function processMessage(message) {
-  let payload = null;
-  let fileId = null;
-  let fileName = null;
-  
-  try {
-    console.log('\n=== PROCESSING MESSAGE ===');
-    
-    try {
-      payload = JSON.parse(Buffer.from(message.data, 'base64').toString('utf8'));
-      fileId = payload.fileId;
-      fileName = payload.fileName?.toLowerCase();
-      
-      console.log(`🔄 Processing file ID: ${fileId}, fileName: ${fileName}`);
-    } catch (parseError) {
-      console.error('❌ Error parsing message payload:', {
-        error: parseError.message,
-        rawData: message.data ? message.data.toString() : 'no data'
-      });
-      message.ack(); // Ack malformed messages
-      return;
-    }
-
-    if (!fileId || !fileName) {
-      console.log('⏭️  Missing fileId or fileName, skipping message');
-      message.ack();
-      return;
-    }
-
-    // Skip if already processed
-    if (processedFileSet.has(fileId) || processedFileNames.has(fileName)) {
-      console.log(`⏭️  Skipping already processed file: ${fileName}`);
-      message.ack();
-      return;
-    }
-
-    // Fetch metadata from Drive
-    let file;
-    try {
-      const res = await drive.files.get({
-        fileId,
-        fields: 'id, name, mimeType, parents',
+      const response = await drive.files.list({
+        q: `'${GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed=false`,
+        fields: 'nextPageToken, files(id, name, mimeType, size, createdTime)',
+        pageSize: 1000,
+        pageToken: pageToken,
         supportsAllDrives: true,
         includeItemsFromAllDrives: true
       });
-      file = res.data;
-      console.log(`🔍 Found file in Drive: ${file.name} (ID: ${file.id})`);
-    } catch (driveError) {
-      console.error('❌ Error fetching file from Drive:', {
-        error: driveError.message,
-        fileId: fileId,
-        fileName: fileName,
-        stack: driveError.stack
-      });
       
-      // Check if it's a not found error (permanent) vs temporary error
-      if (driveError.message.includes('not found') || driveError.message.includes('404')) {
-        console.log('💀 File not found in Drive, acknowledging message');
-        message.ack();
-      } else {
-        console.log('🔄 Temporary Drive error, will retry');
-        message.nack();
+      files.push(...response.data.files);
+      pageToken = response.data.nextPageToken;
+      
+      console.log(`📄 Fetched ${response.data.files.length} files (Total: ${files.length})`);
+    } catch (error) {
+      console.error('❌ Error fetching files:', error);
+      throw error;
+    }
+  } while (pageToken);
+  
+  console.log(`✅ Total files found: ${files.length}`);
+  return files;
+}
+
+// Process files in batches
+async function processBatch() {
+  if (isProcessing) return;
+  
+  isProcessing = true;
+  
+  try {
+    // Fetch all files if not already done
+    if (allFiles.length === 0) {
+      allFiles = await fetchAllFiles();
+      console.log(`🎯 Starting batch processing of ${allFiles.length} files`);
+    }
+    
+    // Calculate batch boundaries
+    const startIndex = currentBatchIndex * BATCH_SIZE;
+    const endIndex = Math.min(startIndex + BATCH_SIZE, allFiles.length);
+    
+    if (startIndex >= allFiles.length) {
+      console.log('🎉 All files have been processed!');
+      if (process.env.AUTO_STOP_WHEN_COMPLETE === 'true') {
+        console.log('🛑 Auto-stopping as all files are complete...');
+        gracefulShutdown();
       }
+      isProcessing = false;
       return;
     }
+    
+    const batchFiles = allFiles.slice(startIndex, endIndex);
+    console.log(`\n🔄 Processing batch ${currentBatchIndex + 1}: files ${startIndex + 1}-${endIndex} of ${allFiles.length}`);
+    
+    // Process files in current batch concurrently
+    const promises = batchFiles.map(file => processFileFromDrive(file));
+    await Promise.all(promises);
+    
+    currentBatchIndex++;
+    
+    console.log(`✅ Batch ${currentBatchIndex} completed. Waiting ${PROCESSING_DELAY}ms before next batch...`);
+    
+    // Schedule next batch
+    setTimeout(() => {
+      isProcessing = false;
+      processBatch();
+    }, PROCESSING_DELAY);
+    
+  } catch (error) {
+    console.error('❌ Error in batch processing:', error);
+    isProcessing = false;
+    
+    // Retry after delay
+    setTimeout(() => {
+      processBatch();
+    }, PROCESSING_DELAY * 2);
+  }
+}
 
+// Process a single file from Drive
+async function processFileFromDrive(file) {
+  const releaseProcessing = await processingSemaphore.acquire();
+  
+  try {
+    const { id: fileId, name: fileName } = file;
+    
+    // Skip if already processed
+    if (processedFileSet.has(fileId) || processedFileNames.has(fileName.toLowerCase())) {
+      console.log(`⏭️  Skipping already processed file: ${fileName}`);
+      totalFilesSkipped++;
+      return;
+    }
+    
+    console.log(`🔍 Processing file: ${fileName} (${fileId})`);
+    
     try {
-      console.log(`🚀 Starting file processing for: ${file.name}`);
+      // Process the file
       await processFile(file, propertyData, drive, mainDestinationFolderId, GEMINI_API_KEY, geminiSemaphore);
-
-      // Add to processed set to avoid duplicates
-      processedFileSet.add(file.id);
-      processedFileNames.add(file.name.toLowerCase());
-
-      // Add to ProcessedFiles sheet after successful processing and copying
+      
+      // Add to processed sets
+      processedFileSet.add(fileId);
+      processedFileNames.add(fileName.toLowerCase());
+      
+      // Add to ProcessedFiles sheet after successful processing
       try {
-        await addProcessedFileToSheet(file.id, file.name);
-        console.log(`📊 File added to ProcessedFiles sheet: ${file.name}`);
+        await addProcessedFileToSheet(fileId, fileName);
+        console.log(`📊 File added to ProcessedFiles sheet: ${fileName}`);
       } catch (sheetError) {
         console.error('⚠️  Warning: Failed to add to sheet (file still processed):', {
           error: sheetError.message,
-          fileName: file.name
+          fileName: fileName
         });
       }
-
-      console.log(`✅ File processed successfully: ${file.name}\n`);
-      message.ack();
+      
+      console.log(`✅ File processed successfully: ${fileName}`);
+      totalFilesProcessed++;
+      
     } catch (processError) {
       console.error('❌ Error during file processing:', {
-        error: processError.message,
-        stack: processError.stack,
-        fileName: file.name,
-        fileId: file.id,
-        errorType: processError.constructor.name
+        fileName,
+        fileId,
+        error: processError.message
       });
-
+      
       // For certain errors, mark as processed to avoid infinite retries
       const msg = String(processError?.message ?? '');
       if (msg.includes('PDF too large') || msg.includes('timeout') || msg.includes('400 Bad Request') || msg.includes('rate limit') || msg.includes('429')) {
         console.log('💀 Marking file as processed due to permanent/rate-limit error');
-        processedFileSet.add(file.id);
-        processedFileNames.add(file.name.toLowerCase());
+        processedFileSet.add(fileId);
+        processedFileNames.add(fileName.toLowerCase());
+        totalFilesProcessed++;
         
         try {
-          await addProcessedFileToSheet(file.id, file.name + ' (ERROR: ' + msg + ')');
+          await addProcessedFileToSheet(fileId, fileName + ' (ERROR: ' + msg + ')');
         } catch (sheetError) {
           console.error('⚠️  Failed to add error record to sheet:', sheetError.message);
         }
-        
-        message.ack();
       } else {
-        console.log('🔄 Retryable error, will nack message');
-        message.nack();
+        console.log('⚠️  Continuing with next file...');
       }
     }
-  } catch (error) {
-    console.error('❌ Unexpected error processing message:', {
-      error: error.message,
-      stack: error.stack,
-      fileId: fileId,
-      fileName: fileName,
-      payload: payload
-    });
-    message.nack();
+  } finally {
+    releaseProcessing();
   }
 }
 
-// Handle incoming messages by adding them to queue
-function setupSubscription() {
-  subscription.on('message', (message) => {
-    // console.log('\n=== NEW MESSAGE RECEIVED - ADDING TO QUEUE ===');
-    messageQueue.push(message);
-    processMessageQueue(); // Start processing if not already running
+// Setup batch processing from Google Drive
+function setupBatchProcessing() {
+  console.log('🚀 Starting batch processing from Google Drive folder...');
+  
+  // Start batch processing
+  processBatch();
+  
+  // Add graceful shutdown handling
+  process.on('SIGINT', () => {
+    console.log('\n🛑 Received SIGINT, shutting down gracefully...');
+    gracefulShutdown();
   });
+  
+  process.on('SIGTERM', () => {
+    console.log('\n🛑 Received SIGTERM, shutting down gracefully...');
+    gracefulShutdown();
+  });
+}
 
-  subscription.on('error', (err) => console.error('Subscription error:', err));
+// Graceful shutdown function
+async function gracefulShutdown() {
+  console.log('📊 Final Statistics:');
+  console.log(`   Total files found: ${allFiles.length}`);
+  console.log(`   Current batch: ${currentBatchIndex + 1}`);
+  console.log(`   Processed files count: ${processedFileSet.size}`);
+  
+  console.log('🔄 Waiting for current processing to complete...');
+  
+  // Wait for current processing to finish
+  while (isProcessing) {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    console.log(`   Still processing batch ${currentBatchIndex + 1}...`);
+  }
+  
+  console.log('✅ All processing completed.');
+  console.log('👋 Shutdown complete.');
+  process.exit(0);
 }
 
 async function initializeApp() {
@@ -301,8 +320,8 @@ async function initializeApp() {
 
   console.log('Setup complete. Starting subscriber...');
 
-  setupSubscription();
-  console.log('Subscriber is now listening for messages.');
+  setupBatchProcessing();
+  console.log('Batch processing is now running.');
 }
 
 // Health check endpoint
@@ -315,10 +334,17 @@ app.get('/status', async (req, res) => {
   try {
     res.json({
       status: 'healthy',
-      processedFiles: processedFileSet.size,
-      processedFileNames: processedFileNames.size,
-      queueLength: messageQueue.length,
-      isProcessing: isProcessing,
+      statistics: {
+        totalFilesFound: allFiles.length,
+        currentBatch: currentBatchIndex + 1,
+        totalBatches: Math.ceil(allFiles.length / BATCH_SIZE),
+        processedFilesCount: processedFileSet.size,
+        progress: allFiles.length > 0 ? `${Math.round((processedFileSet.size / allFiles.length) * 100)}%` : '0%'
+      },
+      status: {
+        isProcessing,
+        currentBatchIndex
+      },
       concurrency: {
         maxConcurrentProcessing: MAX_CONCURRENT_PROCESSING,
         maxGeminiConcurrent: MAX_GEMINI_CONCURRENT
@@ -329,7 +355,7 @@ app.get('/status', async (req, res) => {
         currentUsage: await geminiSemaphore.getCurrentUsage(),
         type: 'local'
       },
-      processingType: 'local-parallel'
+      processingType: 'batch-drive-folder'
     });
   } catch (error) {
     res.status(500).json({
