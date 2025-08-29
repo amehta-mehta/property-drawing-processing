@@ -1,0 +1,22 @@
+{
+  "name": "google-drive-batch-splitter",
+  "version": "1.0.0",
+  "description": "Split large Google Drive folders into organized batches using Google Drive API",
+  "main": "batch-splitter.js",
+  "scripts": {
+    "start": "node batch-splitter.js",
+    "status": "node -e \"require('./batch-splitter').checkStatus()\"",
+    "resume": "node batch-splitter.js"
+  },
+  "dependencies": {
+    "googleapis": "^132.0.0",
+    "node-fetch": "^3.3.2"
+  },
+  "keywords": [
+    "google-drive",
+    "batch-processing",
+    "file-organization"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
+}
