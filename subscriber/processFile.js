@@ -111,8 +111,7 @@ async function extractYearWithGemini(file, drive, geminiApiKey, geminiSemaphore 
 
     const base64Data = buffer.toString('base64');
 
-    // Check file size limit for Gemini API (reduce to 10MB to be safe)
-    const maxBase64Size = 10 * 1024 * 1024; // 10MB in characters
+    const maxBase64Size = 35 * 1024 * 1024; // 10MB in characters
     if (base64Data.length > maxBase64Size) {
       console.log(`⚠️  PDF too large for Gemini API, skipping year extraction`);
       return 'Unknown_Year';
