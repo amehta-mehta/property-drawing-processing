@@ -9,8 +9,8 @@ const { getOrCreateDestinationFolder, propertyMap, getPropertyData } = require('
 const credentials = require('./service-account.json');
 const { LocalSemaphore } = require('./distributedSemaphore');
 
-const MAX_GEMINI_CONCURRENT = parseInt(process.env.MAX_GEMINI_CONCURRENT) || 5;
-const MAX_CONCURRENT_PROCESSING = parseInt(process.env.MAX_CONCURRENT_PROCESSING) || 5;
+const MAX_GEMINI_CONCURRENT = parseInt(process.env.MAX_GEMINI_CONCURRENT) || 3;
+const MAX_CONCURRENT_PROCESSING = parseInt(process.env.MAX_CONCURRENT_PROCESSING) || 3;
 // Initialize local Gemini semaphore for rate limiting
 const geminiSemaphore = new LocalSemaphore('gemini-api', MAX_GEMINI_CONCURRENT);
 
