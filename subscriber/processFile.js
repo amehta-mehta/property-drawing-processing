@@ -98,11 +98,8 @@ function populatePropertyMap(propertyData) {
 // Identify property by substring
 function identifyPropertyFromFilename(filename) {
   const clean = normalizeFilename(filename);
-  console.log(`🔍 Searching for property in filename: "${filename}"`);
-  console.log(`🧹 Normalized filename: "${clean}"`);
   
   for (const [lowName, canonical] of propertyMap.entries()) {
-    console.log(`  Checking if "${clean}" includes "${lowName}"`);
     if (clean.includes(lowName)) {
       console.log(`  ✅ Match found: "${canonical}"`);
       return canonical;
