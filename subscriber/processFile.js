@@ -7,7 +7,64 @@ const fs = require('fs-extra');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
+const { Storage } = require('@google-cloud/storage');
 const { propertyMap } = require('./sheetUtils.js');
+
+// Configure Google Cloud Storage
+const storage = new Storage();
+const GCS_BUCKET = process.env.GCS_BUCKET_NAME;
+const FILE_SIZE_THRESHOLD = 48 * 1024 * 1024; // 48MB in bytes
+
+// GCS Helper Functions
+async function uploadToGCS(buffer, key) {
+  try {
+    const bucket = storage.bucket(GCS_BUCKET);
+    const file = bucket.file(key);
+    
+    await file.save(buffer, {
+      metadata: {
+        contentType: 'application/pdf'
+      }
+    });
+    
+    const publicUrl = `gs://${GCS_BUCKET}/${key}`;
+    console.log(`📤 Uploaded to GCS: ${publicUrl}`);
+    return publicUrl;
+  } catch (error) {
+    console.error('❌ GCS upload failed:', error.message);
+    throw error;
+  }
+}
+
+async function downloadFromGCS(key) {
+  try {
+    const bucket = storage.bucket(GCS_BUCKET);
+    const file = bucket.file(key);
+    
+    const [buffer] = await file.download();
+    console.log(`📥 Downloaded from GCS: ${key}`);
+    return buffer;
+  } catch (error) {
+    console.error('❌ GCS download failed:', error.message);
+    throw error;
+  }
+}
+
+async function deleteFromGCS(key) {
+  try {
+    const bucket = storage.bucket(GCS_BUCKET);
+    const file = bucket.file(key);
+    
+    await file.delete();
+    console.log(`🗑️ Deleted from GCS: ${key}`);
+  } catch (error) {
+    console.error('❌ GCS delete failed:', error.message);
+  }
+}
+
+function bytesToMB(bytes) {
+  return bytes / (1024 * 1024);
+}
 
 // Normalize filename for matching
 function normalizeFilename(filename) {
@@ -183,25 +240,88 @@ Respond ONLY with a 4-digit year (1950-current) or UNKNOWN.
     
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`;
     
-    // Download PDF bytes using Drive API
-    const pdfRes = await drive.files.get({
+    // Get file size first
+    const fileInfo = await drive.files.get({
       fileId: file.id,
-      alt: 'media',
+      fields: 'size,name',
       supportsAllDrives: true
     });
-
-    // Convert response to Buffer
+    
+    const fileSize = parseInt(fileInfo.data.size || '0');
+    const fileName = fileInfo.data.name || file.name;
+    
+    console.log(`📄 Processing file: ${fileName} (${bytesToMB(fileSize).toFixed(2)}MB)`);
+    
     let buffer;
-    if (Buffer.isBuffer(pdfRes.data)) {
-      buffer = pdfRes.data;
-    } else if (pdfRes.data?.arrayBuffer) {
-      const arrayBuffer = await pdfRes.data.arrayBuffer();
-      buffer = Buffer.from(arrayBuffer);
-    } else if (pdfRes.data) {
-      // Fallback: if data is already a string/base64
-      buffer = Buffer.from(pdfRes.data);
+    let gcsKey = null;
+    
+    // Check if file is larger than threshold
+    if (fileSize > FILE_SIZE_THRESHOLD) {
+      console.log(`⚠️  File too large (${bytesToMB(fileSize).toFixed(2)}MB), using GCS for processing...`);
+      
+      // Generate unique GCS key
+      gcsKey = `large-files/${file.id}_${Date.now()}.pdf`;
+      
+      try {
+        // Download from Google Drive
+        const pdfRes = await drive.files.get({
+          fileId: file.id,
+          alt: 'media',
+          supportsAllDrives: true
+        });
+        
+        // Convert response to Buffer
+        if (Buffer.isBuffer(pdfRes.data)) {
+          buffer = pdfRes.data;
+        } else if (pdfRes.data?.arrayBuffer) {
+          const arrayBuffer = await pdfRes.data.arrayBuffer();
+          buffer = Buffer.from(arrayBuffer);
+        } else if (pdfRes.data) {
+          buffer = Buffer.from(pdfRes.data);
+        } else {
+          throw new Error('Unable to read PDF bytes from Drive response');
+        }
+        
+        // Upload to GCS
+        await uploadToGCS(buffer, gcsKey);
+        
+        // Download from GCS (this ensures we can process it)
+        buffer = await downloadFromGCS(gcsKey);
+        
+      } catch (gcsError) {
+        console.error('❌ GCS processing failed:', gcsError.message);
+        // Fallback to direct processing if GCS fails
+        const pdfRes = await drive.files.get({
+          fileId: file.id,
+          alt: 'media',
+          supportsAllDrives: true
+        });
+        
+        if (Buffer.isBuffer(pdfRes.data)) {
+          buffer = pdfRes.data;
+        } else if (pdfRes.data?.arrayBuffer) {
+          const arrayBuffer = await pdfRes.data.arrayBuffer();
+          buffer = Buffer.from(arrayBuffer);
+        } else {
+          buffer = Buffer.from(pdfRes.data);
+        }
+      }
     } else {
-      throw new Error('Unable to read PDF bytes from Drive response');
+      // Download directly from Google Drive for smaller files
+      const pdfRes = await drive.files.get({
+        fileId: file.id,
+        alt: 'media',
+        supportsAllDrives: true
+      });
+      
+      if (Buffer.isBuffer(pdfRes.data)) {
+        buffer = pdfRes.data;
+      } else if (pdfRes.data?.arrayBuffer) {
+        const arrayBuffer = await pdfRes.data.arrayBuffer();
+        buffer = Buffer.from(arrayBuffer);
+      } else {
+        buffer = Buffer.from(pdfRes.data);
+      }
     }
 
     const base64Data = buffer.toString('base64');
@@ -261,6 +381,10 @@ Respond ONLY with a 4-digit year (1950-current) or UNKNOWN.
           if (await fs.pathExists(compressedJpegPath)) {
             await fs.remove(compressedJpegPath);
           }
+          // Clean up GCS file if it was used
+          if (gcsKey) {
+            await deleteFromGCS(gcsKey);
+          }
           return 'Unknown_Year';
         }
       } catch (compressionError) {
@@ -276,8 +400,20 @@ Respond ONLY with a 4-digit year (1950-current) or UNKNOWN.
       generationConfig: { temperature: 0.0, topK: 1, topP: 0.1, candidateCount: 1 }
     };
     
-    return await callGeminiWithPayload(payload, url, geminiSemaphore);
+    const result = await callGeminiWithPayload(payload, url, geminiSemaphore);
+    
+    // Clean up GCS file if it was used
+    if (gcsKey) {
+      await deleteFromGCS(gcsKey);
+    }
+    
+    return result;
   } catch (error) {
+    // Clean up GCS file if it was used, even on error
+    if (gcsKey) {
+      await deleteFromGCS(gcsKey);
+    }
+    
     if (error.name === 'AbortError') {
       console.error('Gemini API call timed out after 15 seconds');
     } else {
