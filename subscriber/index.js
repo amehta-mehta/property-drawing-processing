@@ -4,13 +4,13 @@ const express = require('express');
 const fs = require('fs');
 const { google } = require('googleapis');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
-const { processFile } = require('./processFile.js');
+const { processFile, populatePropertyMap } = require('./processFile.js');
 const { getOrCreateDestinationFolder, propertyMap, getPropertyData } = require('./sheetUtils.js');
 const credentials = require('./service-account.json');
 const { LocalSemaphore } = require('./distributedSemaphore');
 
-const MAX_GEMINI_CONCURRENT = parseInt(process.env.MAX_GEMINI_CONCURRENT) || 3;
-const MAX_CONCURRENT_PROCESSING = parseInt(process.env.MAX_CONCURRENT_PROCESSING) || 3;
+const MAX_GEMINI_CONCURRENT = parseInt(process.env.MAX_GEMINI_CONCURRENT) || 1;
+const MAX_CONCURRENT_PROCESSING = parseInt(process.env.MAX_CONCURRENT_PROCESSING) || 1;
 // Initialize local Gemini semaphore for rate limiting
 const geminiSemaphore = new LocalSemaphore('gemini-api', MAX_GEMINI_CONCURRENT);
 
@@ -353,6 +353,8 @@ async function initializeApp() {
 
   try {
     propertyData = await getPropertyData(SPREADSHEET_ID, PROPERTY_SHEET_NAME, credentials);
+    // Populate the propertyMap for substring matching
+    populatePropertyMap(propertyData);
   } catch (err) {
     console.error('Failed to load property data:', err);
     propertyData = [];

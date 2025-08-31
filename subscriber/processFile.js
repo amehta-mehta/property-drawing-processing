@@ -2,6 +2,10 @@
 const fetch = require('node-fetch');
 const pdf = require('pdf-parse');
 const { google } = require('googleapis');
+const sharp = require('sharp');
+const fs = require('fs-extra');
+const path = require('path');
+const { execFileSync } = require('child_process');
 
 const { propertyMap } = require('./sheetUtils.js');
 
@@ -14,12 +18,97 @@ function toTitleCase(str) {
   return str.toLowerCase().replace(/\b[a-z]/g, c => c.toUpperCase());
 }
 
+// Helper functions for PDF compression
+function bytesToMB(b) { return b / (1024 * 1024); }
+function fileMB(fp) { return bytesToMB(fs.statSync(fp).size); }
+
+// Rasterize a single-page PDF to a JPEG using pdftoppm
+function pdfToJpeg(pdfPath, outPrefix, dpi = 300) {
+  execFileSync("pdftoppm", ["-jpeg", "-r", String(dpi), pdfPath, outPrefix], { stdio: "inherit" });
+  return `${outPrefix}-1.jpg`;
+}
+
+// Progressive compress JPEG with sharp until under targetMB or floor reached
+async function compressJpegToTarget(inJpegPath, destPath, targetMB, startQuality = 95, minQuality = 40) {
+  let quality = startQuality;
+  let lastSizeMB = null;
+  
+  while (quality >= minQuality) {
+    try {
+      await sharp(inJpegPath)
+        .jpeg({ quality, mozjpeg: true })
+        .toFile(destPath);
+    } catch (e) {
+      throw new Error("sharp failed: " + String(e));
+    }
+    
+    const sizeMB = fileMB(destPath);
+    lastSizeMB = sizeMB;
+    if (sizeMB <= targetMB) return { success: true, sizeMB, quality };
+    
+    // Lower quality step
+    if (quality > 70) quality -= 10;
+    else quality -= 5;
+  }
+  
+  // If quality floor reached and still too big, try downsampling image resolution
+  const meta = await sharp(inJpegPath).metadata();
+  let width = meta.width || 2000;
+  let height = meta.height || 2000;
+  
+  // Downsize loop
+  while (width > 600 && height > 600) {
+    width = Math.round(width * 0.8);
+    height = Math.round(height * 0.8);
+    
+    try {
+      await sharp(inJpegPath)
+        .resize(width, height, { fit: "inside" })
+        .jpeg({ quality: minQuality, mozjpeg: true })
+        .toFile(destPath);
+    } catch (e) {
+      throw e;
+    }
+    
+    const sizeMB = fileMB(destPath);
+    if (sizeMB <= targetMB) return { success: true, sizeMB, quality: minQuality, width, height };
+  }
+  
+  return { success: false, sizeMB: lastSizeMB ?? fileMB(destPath) };
+}
+
+// Populate propertyMap with existing property data
+function populatePropertyMap(propertyData) {
+  if (!propertyData || propertyData.length === 0) return;
+  
+  propertyData.forEach(prop => {
+    if (prop.name) {
+      const normalized = toTitleCase(prop.name.replace(/\s+/g, ' ').trim());
+      propertyMap.set(normalized.toLowerCase(), normalized);
+    }
+  });
+  
+  console.log(`📋 Populated propertyMap with ${propertyMap.size} properties`);
+  console.log('🗺️ PropertyMap contents:');
+  for (const [key, value] of propertyMap.entries()) {
+    console.log(`  "${key}" -> "${value}"`);
+  }
+}
+
 // Identify property by substring
 function identifyPropertyFromFilename(filename) {
   const clean = normalizeFilename(filename);
+  console.log(`🔍 Searching for property in filename: "${filename}"`);
+  console.log(`🧹 Normalized filename: "${clean}"`);
+  
   for (const [lowName, canonical] of propertyMap.entries()) {
-    if (clean.includes(lowName)) return canonical;
+    console.log(`  Checking if "${clean}" includes "${lowName}"`);
+    if (clean.includes(lowName)) {
+      console.log(`  ✅ Match found: "${canonical}"`);
+      return canonical;
+    }
   }
+  console.log(`  ❌ No property match found`);
   return null;
 }
 
@@ -89,6 +178,14 @@ async function extractYearWithGemini(file, drive, geminiApiKey, geminiSemaphore 
   if (!file.mimeType || !file.mimeType.includes('pdf')) return null;
 
   try {
+    // Define prompt at the beginning so it's available in both paths
+    const prompt = `
+Look at this construction/landscape drawing PDF and find the YEAR it was created.
+Respond ONLY with a 4-digit year (1950-current) or UNKNOWN.
+`;
+    
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`;
+    
     // Download PDF bytes using Drive API
     const pdfRes = await drive.files.get({
       fileId: file.id,
@@ -111,26 +208,92 @@ async function extractYearWithGemini(file, drive, geminiApiKey, geminiSemaphore 
     }
 
     const base64Data = buffer.toString('base64');
-    const maxBase64Size = 48 * 1024 * 1024; // 35MB in characters
+    const maxBase64Size = 48 * 1024 * 1024; // 48MB in characters
+    
+    let finalBase64Data = base64Data;
+    
     if (base64Data.length > maxBase64Size) {
-      console.log(`⚠️  PDF too large for Gemini API, skipping year extraction`);
-      return 'Unknown_Year';
+      console.log(`⚠️  PDF too large for Gemini API (${bytesToMB(base64Data.length).toFixed(2)}MB), compressing...`);
+      
+      try {
+        // Create temporary files for compression
+        const tempDir = path.join(__dirname, 'temp');
+        await fs.ensureDir(tempDir);
+        
+        const tempPdfPath = path.join(tempDir, `temp_${file.id}.pdf`);
+        const tempJpegPath = path.join(tempDir, `temp_${file.id}`);
+        const compressedJpegPath = path.join(tempDir, `compressed_${file.id}.jpg`);
+        
+        // Write PDF to temporary file
+        await fs.writeFile(tempPdfPath, buffer);
+        
+        // Convert PDF to JPEG
+        const jpegPath = pdfToJpeg(tempPdfPath, tempJpegPath, 150); // Lower DPI for compression
+        
+        // Compress JPEG to target size (35MB to leave some buffer)
+        const targetMB = 35;
+        const compressionResult = await compressJpegToTarget(jpegPath, compressedJpegPath, targetMB);
+        
+        if (compressionResult.success) {
+          console.log(`✅ PDF compressed successfully to ${compressionResult.sizeMB.toFixed(2)}MB`);
+          
+          // Read compressed image and convert to base64
+          const compressedBuffer = await fs.readFile(compressedJpegPath);
+          finalBase64Data = compressedBuffer.toString('base64');
+          
+          // Update payload to use image instead of PDF
+          const payload = {
+            contents: [
+              { parts: [{ text: prompt }, { inlineData: { mimeType: 'image/jpeg', data: finalBase64Data } }] }
+            ],
+            generationConfig: { temperature: 0.0, topK: 1, topP: 0.1, candidateCount: 1 }
+          };
+          
+          // Clean up temporary files
+          await fs.remove(tempPdfPath);
+          await fs.remove(jpegPath);
+          await fs.remove(compressedJpegPath);
+          
+          // Continue with Gemini API call using compressed image
+          return await callGeminiWithPayload(payload, url, geminiSemaphore);
+        } else {
+          console.log(`⚠️  Could not compress PDF sufficiently, skipping year extraction`);
+          // Clean up temporary files
+          await fs.remove(tempPdfPath);
+          await fs.remove(jpegPath);
+          if (await fs.pathExists(compressedJpegPath)) {
+            await fs.remove(compressedJpegPath);
+          }
+          return 'Unknown_Year';
+        }
+      } catch (compressionError) {
+        console.error('Error during PDF compression:', compressionError.message);
+        return 'Unknown_Year';
+      }
     }
-    const prompt = `
-Look at this construction/landscape drawing PDF and find the YEAR it was created.
-Respond ONLY with a 4-digit year (1950-current) or UNKNOWN.
-`;
-
+    
     const payload = {
       contents: [
-        { parts: [{ text: prompt }, { inlineData: { mimeType: 'application/pdf', data: base64Data } }] }
+        { parts: [{ text: prompt }, { inlineData: { mimeType: 'application/pdf', data: finalBase64Data } }] }
       ],
       generationConfig: { temperature: 0.0, topK: 1, topP: 0.1, candidateCount: 1 }
     };
+    
+    return await callGeminiWithPayload(payload, url, geminiSemaphore);
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      console.error('Gemini API call timed out after 15 seconds');
+    } else {
+      console.error('Error in extractYearWithGemini:', error.message);
+    }
+    return 'Unknown_Year';
+  }
+}
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`;
+// Helper function to make Gemini API call
+async function callGeminiWithPayload(payload, url, geminiSemaphore) {
+  try {
 
-    // Use semaphore to limit concurrent Gemini API calls
     let releaseFunction = null;
     if (geminiSemaphore) {
       try {
@@ -191,7 +354,7 @@ Respond ONLY with a 4-digit year (1950-current) or UNKNOWN.
     if (error.name === 'AbortError') {
       console.error('Gemini API call timed out after 15 seconds');
     } else {
-      console.error('Error in extractYearWithGemini:', error.message);
+      console.error('Error in callGeminiWithPayload:', error.message);
     }
     return 'Unknown_Year';
   }
@@ -280,5 +443,6 @@ async function processFile(file, propertyData, drive, mainFolderId, geminiApiKey
 }
 
 module.exports = {
-  processFile
+  processFile,
+  populatePropertyMap
 };
