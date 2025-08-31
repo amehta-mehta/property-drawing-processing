@@ -86,14 +86,14 @@ async function getPropertyData(spreadsheetId, sheetName, creds) {
     const rows = await sheet.getRows();
     console.log(`✅ Loaded ${rows.length} properties from sheet`);
 
-    // Return array of { name, address } and filter out incomplete rows
+    // Return array of { name, address } and filter out rows without names
     const properties = rows
       .map(row => {
         const name = readRowField(row, 'Name');
         const address = readRowField(row, 'Address');
         return { name, address };
       })
-      .filter(p => p.name && p.address);
+      .filter(p => p.name);
 
     return properties;
   } catch (error) {
